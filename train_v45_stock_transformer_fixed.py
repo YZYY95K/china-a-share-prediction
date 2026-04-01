@@ -198,22 +198,21 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 V44_CONFIG = {
-    'tree_sample_ratio': 0.15,
-    'nn_sample_ratio': 0.30,
+    'tree_sample_ratio': 1.0,
+    'nn_sample_ratio': 1.0,
     'val_sample_ratio': 1.0,
-    'lgb_estimators': 1000,
-    'xgb_estimators': 1000,
-    'nn_epochs': 100,
-    'nn_batch_size': 64,
-    'nn_verbose': 0,
-    'max_stocks_per_time': 200,
-    'stock_embed_dim': 64,
-    'trans_num_heads': 4,
-    'trans_key_dim': 16,
-    'trans_ff_dim': 128,
+    'lgb_estimators': 2000,
+    'xgb_estimators': 2000,
+    'nn_epochs': 150,
+    'nn_batch_size': 128,
+    'nn_verbose': 1,
+    'max_stocks_per_time': 300,
+    'stock_embed_dim': 128,
+    'trans_num_heads': 8,
+    'trans_key_dim': 32,
+    'trans_ff_dim': 256,
     'trans_dropout': 0.1,
-    'trans_num_layers': 2,
-    # [Fix 6] 新增: 多任务学习辅助目标权重
+    'trans_num_layers': 3,
     'aux_loss_weight': 0.2,
 }
 
