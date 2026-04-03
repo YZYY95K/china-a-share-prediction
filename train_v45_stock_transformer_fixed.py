@@ -398,11 +398,11 @@ else:
 print(f"  ✅ 统一训练数据: {len(train_data_tree):,} 行")
 print(f"  ✅ 验证集数据: {len(val_data):,} 行")
 
-VAL_SAMPLE_RATIO = 0.01
+VAL_SAMPLE_RATIO = 1.0  # 不采样，完整预测
 if len(val_data) > 100_000:
     val_sample_idx = np.random.RandomState(42).choice(len(val_data), size=int(len(val_data) * VAL_SAMPLE_RATIO), replace=False)
     val_data = val_data.iloc[val_sample_idx].copy()
-    print(f"  ✅ 验证集降采样: 6,572,500 → {len(val_data):,} 行 (1%)")
+    print(f"  ✅ 验证集采样: {len(val_data):,} 行 (完整)")
     gc.collect()
 
 clear_mem()
@@ -739,52 +739,7 @@ else:
     }
 
 # ============================================================
-# 8. LightGBM训练
-# ============================================================
-print("\n" + "="*60)
-print("[8] LightGBM 训练")
-print("="*60)
-step_start = time.time()
-if HAS_PSUTIL:
-    mem_start = proc.memory_info().rss / 1024**2
-
-del train_data_tree
-clear_mem()
-log_substep("已释放 train_data_tree 内存")
-tscv = PurgedGroupTimeSeriesSplit(n_splits=N_SPLITS, group_gap=GROUP_GAP)
-lgb_models = []
-fold_r2_list = []
-
-for fold, (train_idx, val_idx) in enumerate(tscv.split(X_train_tree, groups=tree_groups)):
-    print(f"\n  Fold {fold+1}/{N_SPLITS}")
-    log_substep(f"训练样本: {len(train_idx):,}, 验证样本: {len(val_idx):,}")
-
-    fold_start = time.time()
-    model = lgb.LGBMRegressor(**lgb_params)
-    model.fit(X_train_tree[train_idx], y_train_tree[train_idx], sample_weight=sample_weights_tree[train_idx])
-    log_substep(f"训练耗时: {time.time() - fold_start:.1f}秒")
-
-    val_pred = model.predict(X_train_tree[val_idx])
-    fold_r2 = r2_score(y_train_tree[val_idx], val_pred)
-    fold_r2_list.append(fold_r2)
-    log_substep(f"Fold {fold+1} R²: {fold_r2:.6f}")
-
-    lgb_models.append(model)
-    clear_mem()
-
-print(f"\n  📊 LightGBM 折叠R²: {[f'{r:.6f}' for r in fold_r2_list]}")
-lgb_val_pred = np.mean([m.predict(X_val) for m in lgb_models], axis=0)
-lgb_r2 = r2_score(y_val, lgb_val_pred)
-print(f"  ✅ LightGBM Val R²: {lgb_r2:.6f}")
-step_start = log_step("[8] LightGBM训练", step_start, mem_start if HAS_PSUTIL else None)
-
-# [Fix 8] LightGBM测试集预测: 统一使用5折平均 (与XGBoost一致)
-lgb_test = np.mean([m.predict(X_test) for m in lgb_models], axis=0)
-log_substep("LightGBM测试预测: 使用5折平均 (Fix 8: 与XGBoost一致)")
-clear_mem()
-
-# ============================================================
-# 9. XGBoost训练
+# 8. XGBoost训练
 # ============================================================
 print("\n" + "="*60)
 print("[9] XGBoost 训练")
@@ -840,84 +795,108 @@ log_substep("XGBoost测试预测: 使用5折平均 (Fix 8: 与LightGBM一致)")
 clear_mem()
 
 # ============================================================
-# 10. Ridge回归
+# 9. 1D CNN模型 (PyTorch)
 # ============================================================
 print("\n" + "="*60)
-print("[10] Ridge 回归")
+print("[9] 1D CNN 模型")
 print("="*60)
 step_start = time.time()
 if HAS_PSUTIL:
     mem_start = proc.memory_info().rss / 1024**2
 
-scaler_ridge = StandardScaler()
-X_train_scaled = scaler_ridge.fit_transform(X_train_tree)
-X_val_scaled = scaler_ridge.transform(X_val)
+class StockCNN1D(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.conv1 = nn.Conv1d(n_features, 128, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.conv2 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.conv3 = nn.Conv1d(256, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
 
-ridge = Ridge(alpha=10.0)
-ridge.fit(X_train_scaled, y_train_tree, sample_weight=sample_weights_tree)
-ridge_val_pred = ridge.predict(X_val_scaled)
-ridge_r2 = r2_score(y_val, ridge_val_pred)
-print(f"  ✅ Ridge Val R²: {ridge_r2:.6f}")
-step_start = log_step("[10] Ridge训练", step_start, mem_start if HAS_PSUTIL else None)
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = self.pool(x).squeeze(-1)
+        return self.head(x).squeeze(-1)
 
-del X_train_scaled, X_val_scaled
-clear_mem()
+X_train_cnn = X_train_seq_scaled
+X_val_cnn = X_val_seq_scaled
+
+cnn_models = []
+cnn_val_preds = []
+
+for seed in [42, 2023]:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    model = StockCNN1D(n_features).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
+
+    train_dataset = TensorDataset(
+        torch.FloatTensor(X_train_cnn),
+        torch.FloatTensor(y_train_seq.reshape(-1, 1))
+    )
+    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)
+
+    best_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(50):
+        model.train()
+        train_loss = 0
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+            optimizer.zero_grad()
+            pred = model(batch_x)
+            loss = nn.functional.mse_loss(pred, batch_y.squeeze())
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        scheduler.step()
+
+        if (epoch + 1) % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                val_tensor = torch.FloatTensor(X_val_cnn).to(DEVICE)
+                val_pred = model(val_tensor).cpu().numpy()
+                val_r2 = r2_score(y_val_seq.flatten(), val_pred)
+                print(f"    Epoch {epoch+1}: loss={train_loss/len(train_loader):.6f}, val_r2={val_r2:.6f}")
+
+            if train_loss/len(train_loader) < best_loss - 1e-5:
+                best_loss = train_loss/len(train_loader)
+                patience_counter = 0
+                best_state = model.state_dict().copy()
+            else:
+                patience_counter += 1
+                if patience_counter >= 10:
+                    print(f"    Early stopping at epoch {epoch+1}")
+                    break
+
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        val_tensor = torch.FloatTensor(X_val_cnn).to(DEVICE)
+        val_pred = model(val_tensor).cpu().numpy()
+        cnn_val_preds.append(val_pred)
+    cnn_models.append(model)
+
+cnn_val_pred = np.mean(cnn_val_preds, axis=0)
+cnn_r2 = r2_score(y_val, cnn_val_pred)
+print(f"  ✅ CNN Val R²: {cnn_r2:.6f}")
+step_start = log_step("[9] CNN训练", step_start, mem_start if HAS_PSUTIL else None)
 
 # ============================================================
-# 10.5 ExtraTrees训练 (增加模型多样性)
-# ============================================================
-print("\n" + "="*60)
-print("[10.5] ExtraTrees 训练 (多样性增强)")
-print("="*60)
-step_start = time.time()
-if HAS_PSUTIL:
-    mem_start = proc.memory_info().rss / 1024**2
-
-from sklearn.ensemble import ExtraTreesRegressor
-
-et_params = {
-    'n_estimators': 500,
-    'max_depth': 15,
-    'min_samples_split': 10,
-    'min_samples_leaf': 5,
-    'max_features': 0.6,
-    'random_state': 42,
-    'n_jobs': -1,
-}
-
-et_models = []
-fold_r2_list = []
-
-for fold, (train_idx, val_idx) in enumerate(tscv.split(X_train_tree, groups=tree_groups)):
-    print(f"\n  Fold {fold+1}/{N_SPLITS}")
-    log_substep(f"训练样本: {len(train_idx):,}, 验证样本: {len(val_idx):,}")
-
-    fold_start = time.time()
-    model = ExtraTreesRegressor(**et_params)
-    model.fit(X_train_tree[train_idx], y_train_tree[train_idx], sample_weight=sample_weights_tree[train_idx])
-    log_substep(f"训练耗时: {time.time() - fold_start:.1f}秒")
-
-    val_pred = model.predict(X_train_tree[val_idx])
-    fold_r2 = r2_score(y_train_tree[val_idx], val_pred)
-    fold_r2_list.append(fold_r2)
-    log_substep(f"Fold {fold+1} R²: {fold_r2:.6f}")
-
-    et_models.append(model)
-    clear_mem()
-
-print(f"\n  📊 ExtraTrees 折叠R²: {[f'{r:.6f}' for r in fold_r2_list]}")
-et_val_pred = np.mean([m.predict(X_val) for m in et_models], axis=0)
-et_r2 = r2_score(y_val, et_val_pred)
-print(f"  ✅ ExtraTrees Val R²: {et_r2:.6f}")
-step_start = log_step("[10.5] ExtraTrees训练", step_start, mem_start if HAS_PSUTIL else None)
-
-# [Fix 8] ExtraTrees测试集预测: 统一使用5折平均
-et_test = np.mean([m.predict(X_test) for m in et_models], axis=0)
-log_substep("ExtraTrees测试预测: 使用5折平均 (Fix 8: 与其他树模型一致)")
-clear_mem()
-
-# ============================================================
-# [Fix 2] 11. 股票导向Transformer - 数据重构 (向量化优化)
+# [Fix 2] 10. 股票导向Transformer - 数据重构 (向量化优化)
 # ============================================================
 print("\n" + "="*60)
 print("[11] 股票导向Transformer - 数据重构 (Fix 2: 向量化)")
@@ -1329,8 +1308,6 @@ if USE_TORCH:
     trans_r2_final = r2_score(y_val_flat, trans_val_pred_flat)
     print(f"\n  ✅ Transformer 平均 Val R² (Top股票子集): {trans_r2_final:.6f}")
 
-    tree_avg_val = (lgb_val_pred + xgb_val_pred + ridge_val_pred + et_val_pred) / 4
-
     trans_val_pred_full = np.full(len(y_val), np.nan, dtype='float32')
 
     if len(val_row_map) > 0:
@@ -1344,8 +1321,8 @@ if USE_TORCH:
     uncovered_mask = np.isnan(trans_val_pred_full)
     n_covered = (~uncovered_mask).sum()
     if uncovered_mask.any():
-        trans_val_pred_full[uncovered_mask] = ridge_val_pred[uncovered_mask]
-        log_substep(f"未覆盖样本使用Ridge回退 (更稳定的线性基线)")
+        trans_val_pred_full[uncovered_mask] = xgb_val_pred[uncovered_mask]
+        log_substep(f"未覆盖样本使用XGBoost回退")
 
     print(f"  ✅ Transformer 验证覆盖: {n_covered:,}/{len(y_val):,} ({n_covered/len(y_val)*100:.1f}%)")
 
@@ -1375,8 +1352,8 @@ if HAS_PSUTIL:
     mem_start = proc.memory_info().rss / 1024**2
 
 # [Fix 5] 所有模型的R²均在全样本上评估，可直接比较
-models_r2 = {'lgb': lgb_r2, 'xgb': xgb_r2, 'ridge': ridge_r2, 'et': et_r2}
-models_val = {'lgb': lgb_val_pred, 'xgb': xgb_val_pred, 'ridge': ridge_val_pred, 'et': et_val_pred}
+models_r2 = {'xgb': xgb_r2, 'cnn': cnn_r2}
+models_val = {'xgb': xgb_val_pred, 'cnn': cnn_val_pred}
 
 if USE_TRANSFORMER:
     models_r2['transformer'] = trans_r2_full
@@ -1440,14 +1417,17 @@ step_start = time.time()
 if HAS_PSUTIL:
     mem_start = proc.memory_info().rss / 1024**2
 
-# [Fix 8] 所有树模型统一使用5折平均
-log_substep(f"LightGBM 预测完成: {len(lgb_test):,} 样本 (5折平均)")
 log_substep(f"XGBoost 预测完成: {len(xgb_test):,} 样本 (5折平均)")
 
-ridge_test = ridge.predict(scaler_ridge.transform(X_test))
-log_substep(f"Ridge 预测完成: {len(ridge_test):,} 样本")
-
-log_substep(f"ExtraTrees 预测完成: {len(et_test):,} 样本 (5折平均)")
+cnn_test_preds = []
+for model in cnn_models:
+    model.eval()
+    with torch.no_grad():
+        test_tensor = torch.FloatTensor(X_test_seq_scaled).to(DEVICE)
+        pred = model(test_tensor).cpu().numpy()
+        cnn_test_preds.append(pred)
+cnn_test = np.mean(cnn_test_preds, axis=0)
+log_substep(f"CNN 预测完成: {len(cnn_test):,} 样本")
 
 if USE_TRANSFORMER:
     print("\n  重构测试数据 (向量化)...")
@@ -1487,11 +1467,11 @@ if USE_TRANSFORMER:
         n_test_valid = min(len(valid_test_indices), len(pred_values))
         trans_test_full[valid_test_indices[:n_test_valid]] = pred_values[:n_test_valid]
 
-    # [Fix 3] 加权回退: 使用Ridge预测
+    # [Fix 3] 加权回退: 使用XGBoost预测
     uncovered_mask = np.isnan(trans_test_full)
     n_covered = (~uncovered_mask).sum()
     if uncovered_mask.any():
-        trans_test_full[uncovered_mask] = ridge_test[uncovered_mask]
+        trans_test_full[uncovered_mask] = xgb_test[uncovered_mask]
 
     log_substep(f"Transformer 覆盖: {n_covered:,}/{len(X_test):,} ({n_covered/len(X_test)*100:.1f}%)")
 else:
@@ -1500,19 +1480,19 @@ else:
 if final_fusion_mode == 'stacking':
     log_substep("使用Stacking融合...")
     if USE_TRANSFORMER:
-        stack_test_features = np.column_stack([lgb_test, xgb_test, ridge_test, et_test, trans_test_full])
+        stack_test_features = np.column_stack([xgb_test, cnn_test, trans_test_full])
     else:
-        stack_test_features = np.column_stack([lgb_test, xgb_test, ridge_test, et_test])
+        stack_test_features = np.column_stack([xgb_test, cnn_test])
     final_pred = meta_fitted.predict(stack_test_features)
     log_substep(f"Stacking预测完成")
 else:
     log_substep("使用R²加权融合...")
     trans_weight = weights_r2.get('transformer', 0)
-    tree_weight = weights_r2['lgb'] + weights_r2['xgb'] + weights_r2['ridge'] + weights_r2['et']
-    total_weight = trans_weight + tree_weight
+    other_weight = weights_r2.get('xgb', 0) + weights_r2.get('cnn', 0)
+    total_weight = trans_weight + other_weight
 
-    tree_avg_pred = (weights_r2['lgb'] * lgb_test + weights_r2['xgb'] * xgb_test + weights_r2['ridge'] * ridge_test + weights_r2['et'] * et_test) / tree_weight
-    final_pred = (trans_weight * trans_test_full + tree_weight * tree_avg_pred) / total_weight
+    other_avg_pred = (weights_r2.get('xgb', 0) * xgb_test + weights_r2.get('cnn', 0) * cnn_test) / (other_weight + 1e-8)
+    final_pred = (trans_weight * trans_test_full + other_weight * other_avg_pred) / (total_weight + 1e-8)
 
 log_substep(f"最终预测: {len(final_pred):,} 样本")
 step_start = log_step("[14] 测试集预测", step_start, mem_start if HAS_PSUTIL else None)
@@ -1560,13 +1540,14 @@ for name, w in weights_r2.items():
 print(f"\n修复清单:")
 print(f"  [Fix 1] ✅ 特征选择: OOF方式 (无泄露)")
 print(f"  [Fix 2] ✅ 数据重构: 向量化 (10-100x加速)")
-print(f"  [Fix 3] ✅ Transformer覆盖: 动态股票选择 + Ridge回退")
+print(f"  [Fix 3] ✅ Transformer覆盖: 动态股票选择 + XGBoost回退")
 print(f"  [Fix 4] ✅ Attention Mask: 4D格式 (TF2.x兼容)")
 print(f"  [Fix 5] ✅ 评估一致性: 全样本R²")
 print(f"  [Fix 6] ✅ LabelB/C: 多任务学习 (权重={V44_CONFIG['aux_loss_weight']})")
 print(f"  [Fix 7] ✅ 超参数: Optuna支持 (当前={'开启' if USE_OPTUNA else '关闭'})")
-print(f"  [Fix 8] ✅ XGBoost一致性: 所有树模型统一5折平均")
+print(f"  [Fix 8] ✅ XGBoost一致性: 5折平均")
 print(f"  [Fix 9] ✅ 目标编码: OOF方式 (无泄露)")
+print(f"  [NEW] ✅ 模型简化: 仅保留Transformer, XGBoost, CNN")
 
 step_start = log_step("[15] 保存结果", step_start, mem_start if HAS_PSUTIL else None)
 
