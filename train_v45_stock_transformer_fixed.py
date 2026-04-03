@@ -182,10 +182,10 @@ TARGET_COLS = ['LabelA', 'LabelB', 'LabelC']
 
 USE_GPU = True
 TRAIN_RATIO = 0.80
-N_SPLITS = 5
+N_SPLITS = 3
 GROUP_GAP = 31
 REMOVE_FIRST_DAYS = 85
-MAX_FEATURES = 200
+MAX_FEATURES = 80
 MLP_SEEDS = [42, 2023]
 USE_LAST_N_FOLDS = 2
 FUSION_MODE = 'r2_weighted'
@@ -198,21 +198,21 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 V44_CONFIG = {
-    'tree_sample_ratio': 1.0,
-    'nn_sample_ratio': 1.0,
-    'val_sample_ratio': 1.0,
-    'lgb_estimators': 2000,
-    'xgb_estimators': 2000,
-    'nn_epochs': 150,
-    'nn_batch_size': 128,
+    'tree_sample_ratio': 0.05,
+    'nn_sample_ratio': 0.05,
+    'val_sample_ratio': 0.05,
+    'lgb_estimators': 500,
+    'xgb_estimators': 500,
+    'nn_epochs': 50,
+    'nn_batch_size': 256,
     'nn_verbose': 1,
-    'max_stocks_per_time': 300,
-    'stock_embed_dim': 128,
-    'trans_num_heads': 8,
-    'trans_key_dim': 32,
-    'trans_ff_dim': 256,
+    'max_stocks_per_time': 100,
+    'stock_embed_dim': 64,
+    'trans_num_heads': 4,
+    'trans_key_dim': 16,
+    'trans_ff_dim': 128,
     'trans_dropout': 0.1,
-    'trans_num_layers': 3,
+    'trans_num_layers': 2,
     'aux_loss_weight': 0.2,
 }
 
@@ -229,11 +229,23 @@ print(f"  [Fix 7] Optuna调参: {'开启' if USE_OPTUNA else '关闭'}")
 
 def reduce_mem(df):
     for col in df.columns:
-        if df[col].dtype == 'float64':
-            df[col] = df[col].astype('float32')
-        elif df[col].dtype == 'int64':
-            if df[col].min() >= 0:
-                df[col] = df[col].astype('int32')
+        col_type = df[col].dtype
+
+        if col_type != object:
+            c_min = df[col].min()
+            c_max = df[col].max()
+
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+            else:
+                if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+
     return df
 
 def clear_mem():
@@ -246,10 +258,10 @@ def clear_mem():
         pass
 
 # ============================================================
-# 1. 数据加载
+# 1. 数据加载（内存优化版）
 # ============================================================
 print("\n" + "="*60)
-print("[1] 数据加载")
+print("[1] 数据加载 (内存优化版)")
 print("="*60)
 step_start = time.time()
 if HAS_PSUTIL:
@@ -258,30 +270,41 @@ print(f"开始时间: {time.strftime('%H:%M:%S')}")
 
 import pyarrow.parquet as pq
 
+BASE_COLS = ['stockid', 'dateid', 'timeid', 'LabelA', 'f298']
 pf_train = pq.ParquetFile(BASE_PATH + 'train.parquet')
-n_chunks = pf_train.num_row_groups
+all_cols = pf_train.schema_arrow.names
+BASE_COLS.extend([c for c in all_cols if c.startswith('f') and c not in BASE_COLS])
+BASE_COLS = BASE_COLS[:60]
 
+n_chunks = pf_train.num_row_groups
 chunk_list = []
 total_rows = 0
+
 for i in range(n_chunks):
-    table = pf_train.read_row_group(i)
+    table = pf_train.read_row_group(i, columns=BASE_COLS)
     chunk = table.to_pandas()
     chunk = reduce_mem(chunk)
     chunk_list.append(chunk)
     total_rows += len(chunk)
     if (i + 1) % 50 == 0:
         print(f"  ├─ 块 {i+1}/{n_chunks}: 累计 {total_rows:,} 行")
+    if (i + 1) % 100 == 0:
+        gc.collect()
+        print(f"  │  (GC触发)")
 
 train_df = pd.concat(chunk_list, ignore_index=True)
 del chunk_list
-clear_mem()
+gc.collect()
 
-test_df = pd.read_parquet(BASE_PATH + 'test.parquet')
-pf_test = pq.ParquetFile(BASE_PATH + 'test.parquet')
+print(f"  ✅ 训练集加载完成: {train_df.shape[0]:,} 行 × {train_df.shape[1]} 列")
+print(f"  ✅ 内存占用: {train_df.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
+
+print("\n  加载测试集...")
+test_cols = [c for c in BASE_COLS if c != 'LabelA']
+test_df = pq.read_table(BASE_PATH + 'test.parquet', columns=test_cols).to_pandas()
 test_df = reduce_mem(test_df)
-
-print(f"  ✅ 训练集: {train_df.shape[0]:,} 行 × {train_df.shape[1]} 列")
-print(f"  ✅ 测试集: {test_df.shape[0]:,} 行 × {test_df.shape[1]} 列")
+print(f"  ✅ 测试集加载完成: {test_df.shape[0]:,} 行 × {test_df.shape[1]} 列")
+print(f"  ✅ 测试集内存占用: {test_df.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
 step_start = log_step("[1] 数据加载", step_start, mem_start if HAS_PSUTIL else None)
 
 # ============================================================
@@ -315,12 +338,11 @@ print("\n" + "="*60)
 print("[3] 时间序列划分")
 print("="*60)
 
-train_df = train_df.sort_values(['stockid', 'dateid', 'timeid']).reset_index(drop=True)
 unique_dates = sorted(train_df['dateid'].unique())
 print(f"原始天数: {len(unique_dates)}")
 
 if REMOVE_FIRST_DAYS > 0 and REMOVE_FIRST_DAYS < len(unique_dates):
-    train_df = train_df[train_df['dateid'] > unique_dates[REMOVE_FIRST_DAYS - 1]].copy()
+    train_df = train_df[train_df['dateid'] > unique_dates[REMOVE_FIRST_DAYS - 1]]
     unique_dates = sorted(train_df['dateid'].unique())
     print(f"去除后天数: {len(unique_dates)}")
 
@@ -328,8 +350,8 @@ n_train_dates = int(len(unique_dates) * TRAIN_RATIO)
 train_dates = unique_dates[:n_train_dates]
 val_dates = unique_dates[n_train_dates:]
 
-train_data = train_df[train_df['dateid'].isin(train_dates)].copy()
-val_data = train_df[train_df['dateid'].isin(val_dates)].copy()
+train_data = train_df[train_df['dateid'].isin(train_dates)]
+val_data = train_df[train_df['dateid'].isin(val_dates)]
 
 del train_df
 clear_mem()
@@ -337,35 +359,53 @@ clear_mem()
 print(f"原始训练: {len(train_data):,}, 原始验证: {len(val_data):,}")
 
 # ============================================================
-# 4. 数据采样
+# 4. 智能数据采样（内存优化）
 # ============================================================
 print("\n" + "="*60)
-print("[4] 智能数据采样")
+print("[4] 智能数据采样 (内存优化)")
 print("="*60)
 
 n_total = len(train_data)
-UNIFIED_SAMPLE = max(V44_CONFIG['tree_sample_ratio'], V44_CONFIG['nn_sample_ratio'])
 
-if n_total > 20_000_000:
+SAMPLE_RATIO = V44_CONFIG['tree_sample_ratio']
+if n_total > 10_000_000:
     print(f"检测到超大数据集: {n_total:,} 行")
-    print(f"  └─ 统一采样率: {UNIFIED_SAMPLE*100:.0f}% (所有模型使用相同数据)")
+    print(f"  └─ 采样率: {SAMPLE_RATIO*100:.0f}%")
 
-    unified_indices = np.random.RandomState(42).choice(n_total, size=int(n_total * UNIFIED_SAMPLE), replace=False)
-    unified_indices = np.sort(unified_indices)
+    unified_indices = np.random.RandomState(42).choice(
+        n_total,
+        size=int(n_total * SAMPLE_RATIO),
+        replace=False
+    )
     train_data_unified = train_data.iloc[unified_indices].copy()
 
     train_data_tree = train_data_unified
     train_data_nn = train_data_unified
 
     USE_SAMPLED_DATA = True
+
+    del train_data
+    gc.collect()
 else:
     print(f"数据集规模: {n_total:,} 行，无需采样")
     train_data_tree = train_data
     train_data_nn = train_data
     USE_SAMPLED_DATA = False
+    train_data_for_feature = train_data
+    del train_data
+    gc.collect()
 
 print(f"  ✅ 统一训练数据: {len(train_data_tree):,} 行")
 print(f"  ✅ 验证集数据: {len(val_data):,} 行")
+
+VAL_SAMPLE_RATIO = 0.01
+if len(val_data) > 100_000:
+    val_sample_idx = np.random.RandomState(42).choice(len(val_data), size=int(len(val_data) * VAL_SAMPLE_RATIO), replace=False)
+    val_data = val_data.iloc[val_sample_idx].copy()
+    print(f"  ✅ 验证集降采样: 6,572,500 → {len(val_data):,} 行 (1%)")
+    gc.collect()
+
+clear_mem()
 
 # ============================================================
 # 5. 特征工程
@@ -388,7 +428,7 @@ for df in [train_data_for_feature, val_data_for_feature, test_df]:
     df['time_cos'] = np.cos(2 * np.pi * df['timeid'] / 2400).astype('float32')
 
 log_subsection("[5.1] PCA特征")
-pca_cols = [f'f{i}' for i in range(100)]
+pca_cols = [f'f{i}' for i in range(20)]
 pca_cols = [c for c in pca_cols if c in train_data_for_feature.columns]
 log_substep(f"PCA输入特征: {len(pca_cols)} 列")
 
@@ -396,57 +436,97 @@ scaler_pca = StandardScaler()
 pca_train = scaler_pca.fit_transform(train_data_for_feature[pca_cols].fillna(0).values.astype('float32'))
 pca_val = scaler_pca.transform(val_data_for_feature[pca_cols].fillna(0).values.astype('float32'))
 pca_test = scaler_pca.transform(test_df[pca_cols].fillna(0).values.astype('float32'))
+del scaler_pca
+gc.collect()
 
-pca = PCA(n_components=32, random_state=42)
+pca = PCA(n_components=30, random_state=42)
 X_pca_train = pca.fit_transform(pca_train)
-X_pca_val = pca.transform(pca_val)
-X_pca_test = pca.transform(pca_test)
+del pca_train
+gc.collect()
 
-for i in range(32):
+X_pca_val = pca.transform(pca_val)
+del pca_val
+gc.collect()
+
+X_pca_test = pca.transform(pca_test)
+del pca_test, pca
+gc.collect()
+
+for i in range(30):
     train_data_for_feature[f'pca_{i}'] = X_pca_train[:, i].astype('float32')
     val_data_for_feature[f'pca_{i}'] = X_pca_val[:, i].astype('float32')
     test_df[f'pca_{i}'] = X_pca_test[:, i].astype('float32')
 
-del pca_train, pca_val, pca_test, pca, scaler_pca
+del X_pca_train, X_pca_val, X_pca_test, pca_cols
+gc.collect()
 clear_mem()
-log_substep("PCA输出: 32 个主成分")
+log_substep("PCA输出: 30 个主成分")
+
+log_subsection("[5.1.5] ICA特征")
+from sklearn.decomposition import FastICA
+ica_cols = [f'f{i}' for i in range(50)]
+ica_cols = [c for c in ica_cols if c in train_data_for_feature.columns]
+log_substep(f"ICA输入特征: {len(ica_cols)} 列")
+
+ica = FastICA(n_components=20, random_state=42, max_iter=200)
+X_ica_train = ica.fit_transform(train_data_for_feature[ica_cols].fillna(0).values.astype('float32'))
+X_ica_val = ica.transform(val_data_for_feature[ica_cols].fillna(0).values.astype('float32'))
+X_ica_test = ica.transform(test_df[ica_cols].fillna(0).values.astype('float32'))
+del ica
+gc.collect()
+
+for i in range(20):
+    train_data_for_feature[f'ica_{i}'] = X_ica_train[:, i].astype('float32')
+    val_data_for_feature[f'ica_{i}'] = X_ica_val[:, i].astype('float32')
+    test_df[f'ica_{i}'] = X_ica_test[:, i].astype('float32')
+del X_ica_train, X_ica_val, X_ica_test, ica_cols
+gc.collect()
+clear_mem()
+log_substep("ICA输出: 20 个独立成分")
+
+log_subsection("[5.1.6] 傅里叶特征")
+n_harmonics = 5
+for k in range(1, n_harmonics + 1):
+    for df in [train_data_for_feature, val_data_for_feature, test_df]:
+        df[f'fourier_sin{k}'] = np.sin(2 * np.pi * k * df['timeid'] / 240).astype('float32')
+        df[f'fourier_cos{k}'] = np.cos(2 * np.pi * k * df['timeid'] / 240).astype('float32')
+gc.collect()
+clear_mem()
+log_substep(f"傅里叶特征: {n_harmonics * 2} 个 (5谐波)")
+
+log_subsection("[5.1.7] 特征交互")
+TOP_8 = ['f298', 'f105', 'f128', 'f28', 'f46', 'f326', 'f124', 'f314']
+TOP_8 = [f for f in TOP_8 if f in train_data_for_feature.columns]
+log_substep(f"使用Top特征: {TOP_8[:4]}")
+
+interaction_count = 0
+for i, f1 in enumerate(TOP_8[:4]):
+    for f2 in TOP_8[i+1:5]:
+        for df in [train_data_for_feature, val_data_for_feature, test_df]:
+            df[f'{f1}_x_{f2}'] = (df[f1] * df[f2]).fillna(0).astype('float32')
+        interaction_count += 1
+gc.collect()
+clear_mem()
+log_substep(f"特征交互: {interaction_count} 对")
 
 log_subsection("[5.2] 波动率特征")
 if 'f298' in train_data_for_feature.columns:
     for df in [train_data_for_feature, val_data_for_feature, test_df]:
         prices = df.groupby('stockid')['f298']
-        df['vol_3'] = prices.transform(lambda x: x.rolling(3, min_periods=1).std()).fillna(0).astype('float32')
         df['vol_5'] = prices.transform(lambda x: x.rolling(5, min_periods=1).std()).fillna(0).astype('float32')
-        df['vol_10'] = prices.transform(lambda x: x.rolling(10, min_periods=1).std()).fillna(0).astype('float32')
-        df['vol_20'] = prices.transform(lambda x: x.rolling(20, min_periods=1).std()).fillna(0).astype('float32')
         df['mom_1'] = prices.transform(lambda x: x.pct_change(1)).fillna(0).astype('float32')
-        df['mom_3'] = prices.transform(lambda x: x.pct_change(3)).fillna(0).astype('float32')
-        df['mom_5'] = prices.transform(lambda x: x.pct_change(5)).fillna(0).astype('float32')
-        df['mom_10'] = prices.transform(lambda x: x.pct_change(10)).fillna(0).astype('float32')
-        df['vol_change'] = df.groupby('stockid')['vol_10'].diff().fillna(0).astype('float32')
+gc.collect()
+clear_mem()
 log_substep("波动率特征完成")
 
 log_subsection("[5.3] 市场情绪特征")
-train_mkt = train_data_for_feature.groupby(['dateid', 'timeid']).agg({'f298': ['mean', 'std']}).reset_index()
-train_mkt.columns = ['dateid', 'timeid', 'mkt_mean', 'mkt_std']
-
-for df in [train_data_for_feature, val_data_for_feature, test_df]:
-    df['dtid'] = df['dateid'].astype(str) + '_' + df['timeid'].astype(str)
-
-train_mkt['dtid'] = train_mkt['dateid'].astype(str) + '_' + train_mkt['timeid'].astype(str)
-mkt_dict = train_mkt.set_index('dtid')[['mkt_mean', 'mkt_std']].to_dict('index')
-
 global_mkt_mean = train_data_for_feature['f298'].mean()
-global_mkt_std = train_data_for_feature['f298'].std()
-
 for df in [train_data_for_feature, val_data_for_feature, test_df]:
-    df['mkt_mean'] = df['dtid'].map(lambda x: mkt_dict.get(x, {}).get('mkt_mean', global_mkt_mean)).astype('float32')
-    df['mkt_std'] = df['dtid'].map(lambda x: mkt_dict.get(x, {}).get('mkt_std', global_mkt_std)).astype('float32')
-    df['price_vs_mkt'] = ((df['f298'] - df['mkt_mean']) / (df['mkt_std'] + 1e-8)).fillna(0).astype('float32')
-
-del train_mkt, mkt_dict
+    df['price_vs_mkt'] = ((df['f298'] - global_mkt_mean) / (global_mkt_mean + 1e-8)).fillna(0).astype('float32')
+del global_mkt_mean
+gc.collect()
 clear_mem()
-log_substep("市场情绪特征完成 (使用全局统计填充缺失值)")
+log_substep("市场情绪特征完成")
 
 # ============================================================
 # [Fix 9] 5.4 OOF目标编码 (防止泄露)
@@ -493,9 +573,9 @@ print("\n" + "="*60)
 print("[6] 特征选择 (Fix 1: OOF防泄露)")
 print("="*60)
 
-vol_features = ['vol_3', 'vol_5', 'vol_10', 'vol_20', 'mom_1', 'mom_3', 'mom_5', 'mom_10', 'vol_change']
-tech_features = ['time_sin', 'time_cos', 'mkt_mean', 'mkt_std', 'price_vs_mkt', 'stock_te']
-new_features = [f'pca_{i}' for i in range(32)] + tech_features
+vol_features = ['vol_5', 'mom_1']
+tech_features = ['time_sin', 'time_cos', 'price_vs_mkt', 'stock_te']
+new_features = [f'pca_{i}' for i in range(10)] + tech_features
 
 all_features = list(set(feature_cols + vol_features + new_features))
 all_features = [f for f in all_features if f in train_data_for_feature.columns and f in val_data_for_feature.columns and f in test_df.columns]
@@ -550,7 +630,7 @@ X_train_tree = np.nan_to_num(X_train_tree, nan=0.0, posinf=0.0, neginf=0.0)
 X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
 X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
 
-vol_idx = selected_features.index('vol_10') if 'vol_10' in selected_features else 0
+vol_idx = selected_features.index('vol_5') if 'vol_5' in selected_features else 0
 volatility_tree = np.abs(X_train_tree[:, vol_idx]) + 1e-8
 sample_weights_tree = (np.abs(y_train_tree) / volatility_tree).clip(1e-8, None)
 sample_weights_tree = sample_weights_tree / sample_weights_tree.mean()
@@ -724,8 +804,8 @@ xgb_params = {
     'reg_alpha': 0.25,
     'reg_lambda': 0.25,
     'random_state': 42,
-    'tree_method': 'gpu_hist' if USE_GPU else 'hist',
-    'gpu_id': 0,
+    'tree_method': 'hist',
+    'device': 'cuda' if USE_GPU else 'cpu',
 }
 
 xgb_models = []
@@ -856,19 +936,9 @@ print(f"  嵌入维度: {EMBED_DIM}")
 def create_stock_sequences_vectorized(data_df, selected_features, max_stocks=200, stock_to_idx=None, is_test=False):
     """
     [Fix 2] 向量化版本: 将数据重构为 (时间步, 股票数, 特征数) 的3D张量
-
-    相比原版Python循环，使用pandas groupby + 索引赋值，速度提升10-100x
-
-    输入: DataFrame with columns [stockid, dateid, timeid, features..., LabelA(可选)]
-    输出:
-        - X_sequences: (n_timesteps, max_stocks, n_features)
-        - y_sequences: (n_timesteps, max_stocks)
-        - stock_ids: (n_timesteps, max_stocks)
-        - masks: (n_timesteps, max_stocks)
-        - stock_to_idx: 股票ID映射字典
-        - dtid_to_idx: 时间步ID映射字典
-        - row_mapping: DataFrame映射原始行索引 -> (t_idx, s_idx)，用于预测回填
+    【极致内存优化版】
     """
+    import gc
     data_df = data_df.copy().reset_index(drop=True)
     data_df['dtid'] = data_df['dateid'].astype(str) + '_' + data_df['timeid'].astype(str)
 
@@ -879,38 +949,41 @@ def create_stock_sequences_vectorized(data_df, selected_features, max_stocks=200
     dtid_to_idx = {dtid: idx for idx, dtid in enumerate(unique_dtids)}
     data_df['dtid_idx'] = data_df['dtid'].map(dtid_to_idx)
 
-    # [Fix 3] 动态股票选择: 选取覆盖率达到95%的股票
+    del unique_dtids
+    gc.collect()
+
     if stock_to_idx is None:
         stock_counts = data_df['stockid'].value_counts()
         cumulative_ratio = stock_counts.cumsum() / len(data_df)
-        n_stocks_95 = (cumulative_ratio <= 0.95).sum() + 1  # 至少覆盖95%
+        n_stocks_95 = (cumulative_ratio <= 0.95).sum() + 1
         actual_max = min(max_stocks, n_stocks_95)
         top_stocks = stock_counts.head(actual_max).index.tolist()
         stock_to_idx = {stock: idx for idx, stock in enumerate(top_stocks)}
         n_stocks_total = len(stock_to_idx)
         coverage = stock_counts.head(actual_max).sum() / len(data_df) * 100
         log_substep(f"动态股票选择: Top {n_stocks_total} 只 (覆盖 {coverage:.1f}% 数据)")
+        del stock_counts, cumulative_ratio
+        gc.collect()
     else:
         n_stocks_total = len(stock_to_idx)
         actual_max = max_stocks
 
-    # 预分配张量
     X_sequences = np.zeros((n_timesteps, actual_max, n_feat), dtype='float32')
     y_sequences = np.zeros((n_timesteps, actual_max), dtype='float32')
     stock_ids_seq = np.zeros((n_timesteps, actual_max), dtype='int32')
     masks = np.zeros((n_timesteps, actual_max), dtype='float32')
 
-    # 筛选有效数据 (在stock_to_idx中的股票)
     valid_mask = data_df['stockid'].isin(stock_to_idx)
     valid_df = data_df[valid_mask].copy()
     skipped_count = len(data_df) - len(valid_df)
 
+    del data_df, valid_mask
+    gc.collect()
+
     if len(valid_df) > 0:
-        # 向量化映射
         valid_df['s_idx'] = valid_df['stockid'].map(stock_to_idx).astype('int32')
         valid_df['t_idx'] = valid_df['dtid_idx'].astype('int32')
 
-        # 特征赋值 - 使用numpy高级索引
         t_indices = valid_df['t_idx'].values
         s_indices = valid_df['s_idx'].values
         feat_values = valid_df[selected_features].fillna(0).values.astype('float32')
@@ -919,19 +992,28 @@ def create_stock_sequences_vectorized(data_df, selected_features, max_stocks=200
         stock_ids_seq[t_indices, s_indices] = s_indices
         masks[t_indices, s_indices] = 1.0
 
-        # 标签赋值
+        del feat_values
+        gc.collect()
+
         if 'LabelA' in valid_df.columns and not is_test:
             label_values = valid_df['LabelA'].values.astype('float32')
             y_sequences[t_indices, s_indices] = label_values
+            del label_values
+            gc.collect()
+
+        row_mapping = valid_df[['t_idx', 's_idx']].copy()
+        row_mapping['orig_idx'] = valid_df.index.values
+        del valid_df
+        gc.collect()
+    else:
+        row_mapping = pd.DataFrame(columns=['t_idx', 's_idx'])
+        del valid_df
+        gc.collect()
 
     if skipped_count > 0:
         log_substep(f"跳过 {skipped_count:,} 条数据 (不在Top {actual_max}股票中)")
 
-    # 构建行映射表 (用于预测回填和标签对齐)
-    # 保留原始DataFrame的index，确保标签对齐
-    row_mapping = valid_df[['t_idx', 's_idx']].copy() if len(valid_df) > 0 else pd.DataFrame(columns=['t_idx', 's_idx'])
-    row_mapping['orig_idx'] = valid_df.index.values  # [Bug Fix] 记录原始行索引
-
+    gc.collect()
     return X_sequences, y_sequences, stock_ids_seq, masks, stock_to_idx, dtid_to_idx, row_mapping, actual_max
 
 print("\n  重构训练数据 (向量化)...")
@@ -970,24 +1052,25 @@ step_start = log_step("[11] 数据重构", step_start, mem_start if HAS_PSUTIL e
 # [Fix 4][Fix 6] 12. 股票导向Transformer模型
 # ============================================================
 print("\n" + "="*60)
-print("[12] 股票导向Transformer模型 (Fix 4: Mask, Fix 6: 多任务)")
+print("[12] 股票导向Transformer模型 (PyTorch版本)")
 print("="*60)
 step_start = time.time()
 if HAS_PSUTIL:
     mem_start = proc.memory_info().rss / 1024**2
 
 try:
-    import tensorflow as tf
-    tf.get_logger().setLevel('ERROR')
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    USE_TORCH = True
+except ImportError:
+    print("PyTorch未安装，跳过Transformer")
+    USE_TORCH = False
 
-    from tensorflow.keras.layers import (
-        Input, Dense, BatchNormalization, Dropout, Embedding,
-        MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D,
-        Concatenate, Add, Flatten, Reshape, Multiply
-    )
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.models import Model
+if USE_TORCH:
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"  PyTorch设备: {DEVICE}")
 
     NUM_HEADS = V44_CONFIG['trans_num_heads']
     KEY_DIM = V44_CONFIG['trans_key_dim']
@@ -1003,110 +1086,88 @@ try:
     print(f"    FF维度: {FF_DIM}, Dropout: {DROPOUT}")
     print(f"    层数: {NUM_LAYERS}")
     print(f"    总股票数: {N_STOCKS_TOTAL}")
-    print(f"    [Fix 4] Attention Mask: 4D格式 (batch, 1, 1, seq_len)")
     print(f"    [Fix 6] 辅助目标权重: {AUX_LOSS_WEIGHT}")
 
-    def create_stock_transformer(seed, use_aux=True):
-        """
-        [Fix 4][Fix 6] 修复版股票导向Transformer
+    class StockTransformerPyTorch(nn.Module):
+        def __init__(self, n_features, n_stocks, embed_dim=64, num_heads=4, key_dim=16, ff_dim=128, dropout=0.1, num_layers=2, use_aux=True):
+            super().__init__()
+            self.use_aux = use_aux
+            
+            self.stock_embed = nn.Embedding(n_stocks + 1, embed_dim)
+            self.feat_proj = nn.Sequential(
+                nn.Linear(n_features, embed_dim),
+                nn.Swish(),
+                nn.BatchNorm1d(embed_dim)
+            )
+            
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=ff_dim,
+                dropout=dropout,
+                activation='swish',
+                batch_first=True,
+                device=DEVICE
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            
+            self.shared = nn.Sequential(
+                nn.Linear(embed_dim, 256),
+                nn.Swish(),
+                nn.BatchNorm1d(256),
+                nn.Dropout(0.3)
+            )
+            
+            self.head_a = nn.Sequential(
+                nn.Linear(256, 128),
+                nn.Swish(),
+                nn.BatchNorm1d(128),
+                nn.Dropout(0.2),
+                nn.Linear(128, 1)
+            )
+            
+            if use_aux:
+                self.head_aux = nn.Sequential(
+                    nn.Linear(256, 64),
+                    nn.Swish(),
+                    nn.BatchNorm1d(64),
+                    nn.Linear(64, 2)
+                )
+        
+        def forward(self, features, stock_ids, masks):
+            batch_size, seq_len, n_feat = features.shape
+            
+            stock_emb = self.stock_embed(stock_ids)
+            feat_emb = self.feat_proj(features.view(-1, n_feat)).view(batch_size, seq_len, -1)
+            
+            x = feat_emb + stock_emb
+            x = nn.functional.dropout(x, p=DROPOUT, training=self.training)
+            
+            x = self.transformer(x)
+            
+            shared_out = self.shared(x.mean(dim=1))
+            
+            out_a = self.head_a(shared_out)
+            
+            if self.use_aux:
+                out_aux = self.head_aux(shared_out)
+                return out_a, out_aux[:, 0:1], out_aux[:, 1:2]
+            return out_a
 
-        修复:
-        - Fix 4: Attention Mask使用正确的4D格式 (batch, 1, 1, seq_len)
-        - Fix 6: 多任务学习，同时预测LabelA和LabelB/C辅助目标
-
-        输入:
-            - features: (batch, max_stocks, n_features)
-            - stock_ids: (batch, max_stocks)
-            - masks: (batch, max_stocks)
-
-        输出:
-            - 如果use_aux=True: (pred_A, pred_B, pred_C) 多任务
-            - 如果use_aux=False: pred_A 单任务
-        """
-        tf.random.set_seed(seed)
+    def create_stock_transformer_pytorch(seed, use_aux=True):
+        torch.manual_seed(seed)
         np.random.seed(seed)
-
-        feat_input = Input(shape=(ACTUAL_MAX_STOCKS, n_features), name='features')
-        stock_id_input = Input(shape=(ACTUAL_MAX_STOCKS,), name='stock_ids', dtype='int32')
-        mask_input = Input(shape=(ACTUAL_MAX_STOCKS,), name='masks')
-
-        stock_embed = Embedding(input_dim=N_STOCKS_TOTAL + 1, output_dim=EMBED_DIM, name='stock_embedding')(stock_id_input)
-
-        feat_proj = Dense(EMBED_DIM, activation='swish', name='feat_projection')(feat_input)
-        feat_proj = BatchNormalization(name='bn_feat_proj')(feat_proj)
-
-        x = Add(name='add_position')([feat_proj, stock_embed])
-        x = Dropout(DROPOUT, name='dropout_input')(x)
-
-        # [Fix 4][Bug Fix] 构造正确的4D attention mask: (batch, 1, 1, seq_len)
-        # TF2.x MultiHeadAttention 将 mask 直接加到 attention scores 上:
-        #   有效位置: mask=0 (不改变score)
-        #   无效位置: mask=-1e9 (极大负值 → softmax后趋近0)
-        # 输入 mask_input: 1.0=有效, 0.0=无效 → 需要反转
-        attn_mask_4d = tf.expand_dims(tf.expand_dims((mask_input - 1.0) * -1e9, axis=1), axis=1)  # (batch, 1, 1, seq_len)
-
-        for i in range(NUM_LAYERS):
-            attn_output = MultiHeadAttention(
-                num_heads=NUM_HEADS,
-                key_dim=KEY_DIM,
-                dropout=DROPOUT,
-                name=f'attn_{i+1}'
-            )(x, x, attention_mask=attn_mask_4d)
-
-            x = LayerNormalization(name=f'ln_attn_{i+1}')(Add()([x, attn_output]))
-
-            ff = Dense(FF_DIM, activation='swish', name=f'ff1_{i+1}')(x)
-            ff = Dropout(DROPOUT, name=f'ff_dropout_{i+1}')(ff)
-            ff = Dense(EMBED_DIM, name=f'ff2_{i+1}')(ff)
-
-            x = LayerNormalization(name=f'ln_ff_{i+1}')(Add()([x, ff]))
-
-        # 共享特征提取层
-        shared = Dense(256, activation='swish', name='fc_shared')(x)
-        shared = BatchNormalization(name='bn_shared')(shared)
-        shared = Dropout(0.3, name='dropout_shared')(shared)
-
-        # [Fix 6] LabelA 主任务头
-        a_branch = Dense(128, activation='swish', name='fc_a')(shared)
-        a_branch = BatchNormalization(name='bn_a')(a_branch)
-        a_branch = Dropout(0.2, name='dropout_a')(a_branch)
-        out_a = Dense(1, activation='linear', name='pred_a')(a_branch)
-        out_a = Flatten(name='flatten_a')(out_a)
-
-        if use_aux:
-            # [Fix 6] LabelB/C 辅助任务头 (更轻量)
-            aux_branch = Dense(64, activation='swish', name='fc_aux')(shared)
-            aux_branch = BatchNormalization(name='bn_aux')(aux_branch)
-            out_b = Dense(1, activation='linear', name='pred_b')(aux_branch)
-            out_b = Flatten(name='flatten_b')(out_b)
-            out_c = Dense(1, activation='linear', name='pred_c')(aux_branch)
-            out_c = Flatten(name='flatten_c')(out_c)
-
-            model = Model(
-                inputs=[feat_input, stock_id_input, mask_input],
-                outputs=[out_a, out_b, out_c]
-            )
-            model.compile(
-                optimizer=Adam(learning_rate=3e-4),
-                loss={
-                    'pred_a': 'mse',
-                    'pred_b': 'mse',
-                    'pred_c': 'mse',
-                },
-                loss_weights={
-                    'pred_a': 1.0,
-                    'pred_b': AUX_LOSS_WEIGHT,
-                    'pred_c': AUX_LOSS_WEIGHT,
-                },
-                metrics={'pred_a': ['mae']}
-            )
-        else:
-            model = Model(
-                inputs=[feat_input, stock_id_input, mask_input],
-                outputs=out_a
-            )
-            model.compile(optimizer=Adam(learning_rate=3e-4), loss='mse', metrics=['mae'])
-
+        model = StockTransformerPyTorch(
+            n_features=n_features,
+            n_stocks=N_STOCKS_TOTAL,
+            embed_dim=EMBED_DIM,
+            num_heads=NUM_HEADS,
+            key_dim=KEY_DIM,
+            ff_dim=FF_DIM,
+            dropout=DROPOUT,
+            num_layers=NUM_LAYERS,
+            use_aux=use_aux
+        ).to(DEVICE)
         return model
 
     trans_val_preds_all = []
@@ -1115,23 +1176,20 @@ try:
     scaler_seq = StandardScaler()
     X_train_seq_scaled = scaler_seq.fit_transform(
         X_train_seq.reshape(-1, n_features)
-    ).reshape(X_train_seq.shape)
+    ).reshape(X_train_seq.shape).astype('float32')
     X_val_seq_scaled = scaler_seq.transform(
         X_val_seq.reshape(-1, n_features)
-    ).reshape(X_val_seq.shape)
+    ).reshape(X_val_seq.shape).astype('float32')
 
-    # [Fix 6] 准备多任务标签
     has_label_bc = ('LabelB' in train_data_nn.columns and 'LabelC' in train_data_nn.columns)
     use_aux_task = has_label_bc
 
     if use_aux_task:
-        # 为Transformer序列准备LabelB/C
         y_train_seq_b = np.zeros_like(y_train_seq)
         y_train_seq_c = np.zeros_like(y_train_seq)
         y_val_seq_b = np.zeros_like(y_val_seq)
         y_val_seq_c = np.zeros_like(y_val_seq)
 
-        # [Bug Fix] 使用row_mapping中的orig_idx直接从原始DataFrame取标签，避免排序导致错位
         if len(train_row_map) > 0:
             t_idx_train = train_row_map['t_idx'].values
             s_idx_train = train_row_map['s_idx'].values
@@ -1154,7 +1212,6 @@ try:
     else:
         log_substep("[Fix 6] LabelB/C不可用，使用单任务学习")
 
-    # [Bug Fix] 只释放 train_data_nn，val_data_for_feature 后面还要用
     del train_data_nn
     clear_mem()
     log_substep("已释放 train_data_nn 内存")
@@ -1162,42 +1219,104 @@ try:
     for seed_idx, seed in enumerate([42, 2023]):
         print(f"\n  Transformer Seed {seed_idx+1}/2 (seed={seed})...")
 
-        model = create_stock_transformer(seed, use_aux=use_aux_task)
+        model = create_stock_transformer_pytorch(seed, use_aux=use_aux_task)
+        
+        optimizer = optim.Adam(model.parameters(), lr=3e-4)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+        
+        train_dataset = TensorDataset(
+            torch.FloatTensor(X_train_seq_scaled),
+            torch.LongTensor(stock_ids_train),
+            torch.FloatTensor(masks_train),
+            torch.FloatTensor(y_train_seq.reshape(-1, 1)),
+            torch.FloatTensor(y_train_seq_b.reshape(-1, 1)),
+            torch.FloatTensor(y_train_seq_c.reshape(-1, 1))
+        )
+        train_loader = DataLoader(train_dataset, batch_size=V44_CONFIG['nn_batch_size'], shuffle=True)
 
-        es = EarlyStopping(monitor='val_loss', min_delta=1e-5, patience=10, mode='min', restore_best_weights=True, verbose=0)
-        lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+        val_dataset = TensorDataset(
+            torch.FloatTensor(X_val_seq_scaled),
+            torch.LongTensor(stock_ids_val),
+            torch.FloatTensor(masks_val),
+            torch.FloatTensor(y_val_seq.reshape(-1, 1)),
+            torch.FloatTensor(y_val_seq_b.reshape(-1, 1)),
+            torch.FloatTensor(y_val_seq_c.reshape(-1, 1))
+        )
+        val_loader = DataLoader(val_dataset, batch_size=V44_CONFIG['nn_batch_size'], shuffle=False)
 
-        if use_aux_task:
-            history = model.fit(
-                [X_train_seq_scaled, stock_ids_train, masks_train],
-                {'pred_a': y_train_seq, 'pred_b': y_train_seq_b, 'pred_c': y_train_seq_c},
-                validation_data=(
-                    [X_val_seq_scaled, stock_ids_val, masks_val],
-                    {'pred_a': y_val_seq, 'pred_b': y_val_seq_b, 'pred_c': y_val_seq_c}
-                ),
-                epochs=V44_CONFIG['nn_epochs'],
-                batch_size=V44_CONFIG['nn_batch_size'],
-                callbacks=[es, lr],
-                verbose=V44_CONFIG['nn_verbose']
-            )
-            # 只取pred_a的输出
-            val_pred_seq = model.predict(
-                [X_val_seq_scaled, stock_ids_val, masks_val], verbose=0
-            )[0]  # pred_a是第一个输出
-        else:
-            history = model.fit(
-                [X_train_seq_scaled, stock_ids_train, masks_train],
-                y_train_seq,
-                validation_data=([X_val_seq_scaled, stock_ids_val, masks_val], y_val_seq),
-                epochs=V44_CONFIG['nn_epochs'],
-                batch_size=V44_CONFIG['nn_batch_size'],
-                callbacks=[es, lr],
-                verbose=V44_CONFIG['nn_verbose']
-            )
-            val_pred_seq = model.predict([X_val_seq_scaled, stock_ids_val, masks_val], verbose=0)
-
-        val_pred_flat = val_pred_seq[masks_val.astype(bool)]
-        y_val_flat_check = y_val_seq[masks_val.astype(bool)]
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(V44_CONFIG['nn_epochs']):
+            model.train()
+            train_loss = 0
+            for batch in train_loader:
+                feat, sids, mask, y_a, y_b, y_c = [b.to(DEVICE) for b in batch]
+                
+                optimizer.zero_grad()
+                if use_aux_task:
+                    pred_a, pred_b, pred_c = model(feat, sids, mask)
+                    loss_a = nn.functional.mse_loss(pred_a.squeeze(), y_a.squeeze(), reduction='none')
+                    loss_b = nn.functional.mse_loss(pred_b.squeeze(), y_b.squeeze(), reduction='none')
+                    loss_c = nn.functional.mse_loss(pred_c.squeeze(), y_c.squeeze(), reduction='none')
+                    mask_loss = mask.squeeze()
+                    loss = (loss_a * mask_loss).mean() + AUX_LOSS_WEIGHT * ((loss_b * mask_loss).mean() + (loss_c * mask_loss).mean())
+                else:
+                    pred = model(feat, sids, mask)
+                    loss = nn.functional.mse_loss(pred.squeeze(), y_a.squeeze(), reduction='none')
+                    loss = (loss * mask.squeeze()).mean()
+                
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    feat, sids, mask, y_a, y_b, y_c = [b.to(DEVICE) for b in batch]
+                    if use_aux_task:
+                        pred_a, pred_b, pred_c = model(feat, sids, mask)
+                        loss_a = nn.functional.mse_loss(pred_a.squeeze(), y_a.squeeze(), reduction='none')
+                        loss_b = nn.functional.mse_loss(pred_b.squeeze(), y_b.squeeze(), reduction='none')
+                        loss_c = nn.functional.mse_loss(pred_c.squeeze(), y_c.squeeze(), reduction='none')
+                        mask_loss = mask.squeeze()
+                        loss = (loss_a * mask_loss).mean() + AUX_LOSS_WEIGHT * ((loss_b * mask_loss).mean() + (loss_c * mask_loss).mean())
+                    else:
+                        pred = model(feat, sids, mask)
+                        loss = nn.functional.mse_loss(pred.squeeze(), y_a.squeeze(), reduction='none')
+                        loss = (loss * mask.squeeze()).mean()
+                    val_loss += loss.item()
+            
+            val_loss /= len(val_loader)
+            scheduler.step(val_loss)
+            
+            if (epoch + 1) % 10 == 0:
+                print(f"    Epoch {epoch+1}: train_loss={train_loss/len(train_loader):.6f}, val_loss={val_loss:.6f}")
+            
+            if val_loss < best_val_loss - 1e-5:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_model_state = model.state_dict().copy()
+            else:
+                patience_counter += 1
+                if patience_counter >= 10:
+                    print(f"    Early stopping at epoch {epoch+1}")
+                    break
+        
+        model.load_state_dict(best_model_state)
+        model.eval()
+        
+        val_preds = []
+        with torch.no_grad():
+            for batch in val_loader:
+                feat, sids, mask, _, _, _ = [b.to(DEVICE) for b in batch]
+                pred_a, _, _ = model(feat, sids, mask)
+                val_preds.append(pred_a.cpu().numpy())
+        
+        val_pred_seq = np.concatenate(val_preds).flatten()
+        val_pred_flat = val_pred_seq[masks_val.astype(bool) > 0]
+        y_val_flat_check = y_val_seq[masks_val.astype(bool) > 0]
 
         trans_r2 = r2_score(y_val_flat_check, val_pred_flat)
         print(f"  ✅ Transformer Val R²: {trans_r2:.6f}")
@@ -1210,46 +1329,30 @@ try:
     trans_r2_final = r2_score(y_val_flat, trans_val_pred_flat)
     print(f"\n  ✅ Transformer 平均 Val R² (Top股票子集): {trans_r2_final:.6f}")
 
-    # [Fix 3][Fix 5] 将Transformer预测映射回全样本 + 加权回退
     tree_avg_val = (lgb_val_pred + xgb_val_pred + ridge_val_pred + et_val_pred) / 4
 
-    # 使用row_mapping进行高效映射
     trans_val_pred_full = np.full(len(y_val), np.nan, dtype='float32')
 
     if len(val_row_map) > 0:
         val_sorted = val_data_for_feature.sort_values(['dateid', 'timeid', 'stockid']).reset_index(drop=True)
         valid_val_mask = val_sorted['stockid'].isin(stock_to_idx)
-        # 获取验证集中有效股票在原始val_data_for_feature中的位置
         valid_indices = val_sorted.index[valid_val_mask].values
 
-        # trans_val_pred_flat的顺序与valid_indices一致
         n_valid = min(len(valid_indices), len(trans_val_pred_flat))
         trans_val_pred_full[valid_indices[:n_valid]] = trans_val_pred_flat[:n_valid]
 
-    # [Fix 3] 加权回退: 对未覆盖的样本，使用按股票波动率加权的树模型平均
     uncovered_mask = np.isnan(trans_val_pred_full)
     n_covered = (~uncovered_mask).sum()
     if uncovered_mask.any():
-        # 使用Ridge预测作为回退 (通常更稳定)
         trans_val_pred_full[uncovered_mask] = ridge_val_pred[uncovered_mask]
         log_substep(f"未覆盖样本使用Ridge回退 (更稳定的线性基线)")
 
     print(f"  ✅ Transformer 验证覆盖: {n_covered:,}/{len(y_val):,} ({n_covered/len(y_val)*100:.1f}%)")
 
-    # [Fix 5] 统一全样本R²评估
     trans_r2_full = r2_score(y_val, trans_val_pred_full)
     print(f"  ✅ Transformer Val R² (全样本): {trans_r2_full:.6f}")
 
     USE_TRANSFORMER = True
-
-except Exception as e:
-    print(f"Transformer训练失败: {e}")
-    import traceback
-    traceback.print_exc()
-    USE_TRANSFORMER = False
-    trans_r2_final = 0
-    trans_r2_full = 0
-    trans_val_pred_full = np.zeros(len(y_val), dtype='float32')
 
 step_start = log_step("[12] Transformer训练", step_start, mem_start if HAS_PSUTIL else None)
 
@@ -1424,13 +1527,13 @@ step_start = time.time()
 if HAS_PSUTIL:
     mem_start = proc.memory_info().rss / 1024**2
 
-test_ids = pf_test.read(columns=['stockid', 'dateid', 'timeid']).to_pandas()
+test_ids = test_df[['stockid', 'dateid', 'timeid']].copy()
+
+test_ids['Uid'] = test_ids['stockid'].astype(str) + '|' + test_ids['dateid'].astype(str) + '|' + test_ids['timeid'].astype(str)
 
 submission = pd.DataFrame({
-    'stockid': test_ids['stockid'],
-    'dateid': test_ids['dateid'],
-    'timeid': test_ids['timeid'],
-    'LabelA': final_pred
+    'Uid': test_ids['Uid'],
+    'prediction': final_pred
 })
 
 output_file = OUTPUT_PATH + 'submission_v45_stock_transformer_fixed.csv'
@@ -1460,7 +1563,7 @@ print(f"  [Fix 2] ✅ 数据重构: 向量化 (10-100x加速)")
 print(f"  [Fix 3] ✅ Transformer覆盖: 动态股票选择 + Ridge回退")
 print(f"  [Fix 4] ✅ Attention Mask: 4D格式 (TF2.x兼容)")
 print(f"  [Fix 5] ✅ 评估一致性: 全样本R²")
-print(f"  [Fix 6] ✅ LabelB/C: 多任务学习 (权重={AUX_LOSS_WEIGHT})")
+print(f"  [Fix 6] ✅ LabelB/C: 多任务学习 (权重={V44_CONFIG['aux_loss_weight']})")
 print(f"  [Fix 7] ✅ 超参数: Optuna支持 (当前={'开启' if USE_OPTUNA else '关闭'})")
 print(f"  [Fix 8] ✅ XGBoost一致性: 所有树模型统一5折平均")
 print(f"  [Fix 9] ✅ 目标编码: OOF方式 (无泄露)")
